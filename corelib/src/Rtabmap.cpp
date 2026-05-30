@@ -600,6 +600,22 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 	Parameters::parse(parameters, Parameters::kRGBDLinearUpdate(), _rgbdLinearUpdate);
 	Parameters::parse(parameters, Parameters::kMemCovisibilityRedundancyRatio(), _covisRedundancyRatio);
 	Parameters::parse(parameters, Parameters::kMemCovisibilityMaxIntermediateNodes(), _covisMaxIntermediateNodes);
+	if(_covisRedundancyRatio > 0.0f)
+	{
+		// Covisibility redundancy demotes nodes to intermediate nodes, which is
+		// incompatible with graph reduction (see Memory::moveSignatureToWMFromSTM:
+		// "Graph reduction with intermediate nodes is not supported").
+		bool reduceGraph = Parameters::defaultMemReduceGraph();
+		Parameters::parse(parameters, Parameters::kMemReduceGraph(), reduceGraph);
+		if(reduceGraph)
+		{
+			UWARN("%s=%f cannot be used with %s=true (graph reduction does not support "
+				  "intermediate nodes). Disabling covisibility keyframe redundancy reduction.",
+				  Parameters::kMemCovisibilityRedundancyRatio().c_str(), _covisRedundancyRatio,
+				  Parameters::kMemReduceGraph().c_str());
+			_covisRedundancyRatio = 0.0f;
+		}
+	}
 	Parameters::parse(parameters, Parameters::kRGBDAngularUpdate(), _rgbdAngularUpdate);
 	Parameters::parse(parameters, Parameters::kRGBDLinearSpeedUpdate(), _rgbdLinearSpeedUpdate);
 	Parameters::parse(parameters, Parameters::kRGBDAngularSpeedUpdate(), _rgbdAngularSpeedUpdate);
@@ -1628,27 +1644,23 @@ bool Rtabmap::process(
 				if(anchor && anchor->getWeight() >= 0 &&
 				   !anchor->getWords().empty() && !signature->getWords().empty())
 				{
-					std::set<int> anchorWords;
-					for(std::multimap<int, int>::const_iterator iter=anchor->getWords().begin(); iter!=anchor->getWords().end(); ++iter)
-					{
-						anchorWords.insert(iter->first);
-					}
-					std::set<int> currentWords;
-					int shared = 0;
-					for(std::multimap<int, int>::const_iterator iter=signature->getWords().begin(); iter!=signature->getWords().end(); ++iter)
-					{
-						if(currentWords.insert(iter->first).second && anchorWords.find(iter->first) != anchorWords.end())
-						{
-							++shared;
-						}
-					}
-					float coverageRatio = currentWords.empty()?0.0f:float(shared)/float(currentWords.size());
-					if(coverageRatio > _covisRedundancyRatio)
+					// Reuse RTAB-Map's own similarity measure (the same one used by
+					// rehearsal): matched visual words over max(words), in [0,1].
+					// Rehearsal only merges similar STATIONARY frames (rehearsalMerge
+					// bails out as soon as the motion exceeds the update threshold), so
+					// here we handle the complementary case: frames that moved beyond
+					// the update threshold but are still highly covisible with the last
+					// kept keyframe (e.g. slow motion in a long corridor). The anchor is
+					// the immediately-preceding kept keyframe, spatially adjacent through
+					// the odometry chain, so a high value means genuine local redundancy,
+					// not perceptual aliasing of two distant look-alike places.
+					float covisibility = signature->compareTo(*anchor);
+					if(covisibility > _covisRedundancyRatio)
 					{
 						redundantKeyframe = true;
 						_memory->convertToIntermediate(signature->id());
-						UDEBUG("Covisibility redundancy: node %d demoted to intermediate (coverage=%.2f > %.2f with keyframe %d)",
-								signature->id(), coverageRatio, _covisRedundancyRatio, _lastKeyframeId);
+						UDEBUG("Covisibility redundancy: node %d demoted to intermediate (covisibility=%.2f > %.2f with keyframe %d)",
+								signature->id(), covisibility, _covisRedundancyRatio, _lastKeyframeId);
 					}
 				}
 			}

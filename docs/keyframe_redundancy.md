@@ -28,28 +28,37 @@
 
 ## 3. 方法
 
-### 3.1 冗余判据：共视覆盖率
+### 3.1 冗余判据：复用 RTAB-Map 的共视相似度
 
-每生成一个新地图节点，计算它相对**最后保留的关键帧（锚点 anchor）**的**共视覆盖率**：
+每生成一个新地图节点，用 RTAB-Map **自带的相似度函数** `Signature::compareTo()`（与 rehearsal 用的是同一个）计算它相对**最后保留的关键帧（锚点 anchor）**的共视相似度：
 
 ```
-coverage = |words_current ∩ words_anchor| / |unique(words_current)|
+covisibility = compareTo(current, anchor) = 匹配词数 / max(|words_current|, |words_anchor|)   ∈ [0,1]
 ```
 
-- `words_*` 为 BoW 视觉词 ID 集合（RTABMap 在建签名时已算好，取唯一词 ID）。
-- 含义：**当前帧所见内容中，有多大比例已经被锚点覆盖**。
+`covisibility > Mem/CovisibilityRedundancyRatio`（如 0.8）→ 判定为冗余。
 
-`coverage > Mem/CovisibilityRedundancyRatio`（如 0.8）→ 判定为冗余。
+> 复用 `compareTo()` 而非重写：与 rehearsal 语义一致、正确处理无效词、并自动支持全局描述子（若启用）。
 
-### 3.2 为什么用"相对当前帧"的覆盖率（而非 shared/min）
+### 3.2 与 rehearsal 互补（这才是增量价值所在）
 
-这是同时实现 A（减冗余）与 B（回环价值保护）的关键：
+RTAB-Map 的 rehearsal 也用 `compareTo()` 把相似节点合并，但 `Memory::rehearsalMerge()` 里有一道 **`!isMoving` 闸门**——只在运动小于更新阈值（`RGBD/LinearUpdate`/`AngularUpdate`）时才合并。也就是说：
 
-- 用 `shared / |current|`，**带来大量新内容的帧覆盖率自然低 → 自动保留**；
-- 独特地点（即使与锚点有大量重叠，但引入了新结构）不会被误删；
-- 因此"距离区分性保护"是**内建**的，无需额外参数。
+- **rehearsal / smallDisplacement** → 处理"**几乎不动**且相似"的帧；
+- **本功能（`!smallDisplacement` 时触发）** → 处理"**已经在动**但与锚点高度重叠"的帧（如长走廊里慢速前进，每帧重叠 90%）。
 
-### 3.3 锚点 = 最后保留的关键帧（自限制）
+这些"在动但重叠"的帧位移超过阈值，现有机制不会动它们、照样建完整关键帧——正是本功能消减的冗余来源。
+
+### 3.3 为什么内建了独特性保护（B）
+
+`compareTo` 以 `max(words)` 归一化：**带来大量新内容的帧，其词数大 → 分母大 → 相似度低 → 被保留**。所以"独特地点保护"是判据内建的，无需额外规则。（该归一化比"按当前帧归一化"更保守，更不易误删。）
+
+### 3.4 抗感知混叠：单锚点设计
+
+锚点恒为**紧邻的上一关键帧**（通过里程计链相连，空间上相邻）。当前帧只与它比较——因此"高相似度"必然意味着**真实的局部重叠**，而不是"两段长得像但物理不同的走廊"那种全局混叠。混叠需要与**远处**关键帧比较，而本功能从不这样做。
+（更激进的"对空间近邻关键帧并集算覆盖"可消减更多冗余，但会引入混叠风险、需要里程计空间闸门；为优先保证召回，本版采用更保守的单锚点。）
+
+### 3.5 锚点 = 最后保留的关键帧（自限制）
 
 覆盖率始终对**最后一个被保留的关键帧**计算，而不是上一帧：
 
@@ -57,7 +66,7 @@ coverage = |words_current ∩ words_anchor| / |unique(words_current)|
 - 一旦相对锚点的场景变化够大（coverage 跌破阈值），保留当前帧为新关键帧并**更新锚点**；
 - 这天然**限制了降级链的长度**——降级的每一帧都相对同一个"仍然覆盖它"的锚点冗余。
 
-### 3.4 降级动作
+### 3.6 降级动作
 
 冗余帧调用 `Memory::convertToIntermediate()`：
 
@@ -68,7 +77,7 @@ coverage = |words_current ∩ words_anchor| / |unique(words_current)|
 
 这与 RTABMap 既有的 `Rtabmap/CreateIntermediateNodes` 中间节点是同一套机制，只是触发条件从"检测频率"换成"共视覆盖率"。
 
-### 3.5 安全网
+### 3.7 安全网
 
 `Mem/CovisibilityMaxIntermediateNodes`（默认 0=无限）：限制**连续**降级的节点数，超过则强制保留一个关键帧，给回环关键帧间隔加一道上限。
 
@@ -123,16 +132,21 @@ Mem/CovisibilityMaxIntermediateNodes  20
 ```
 
 ### 7.3 与现有机制配合
-- 可与 `RGBD/LinearUpdate`、`Mem/RehearsalSimilarity` 同时使用，三者互补（距离 / 相邻外观 / 全局共视）。
-- 若同时用 `Rtabmap/CreateIntermediateNodes`，注意 `Mem/RehearsalIdUpdatedToNewOne` 应保持 false（与中间节点相关的既有约束）。
+- 可与 `RGBD/LinearUpdate`、`Mem/RehearsalSimilarity` 同时使用，三者互补（距离 / 相邻外观-静止 / 在动时的共视）。
+- **不要**与 `Mem/ReduceGraph=true` 同时使用（不支持中间节点；同时开会被自动禁用并告警）。
+- 验证阶段可设 `Mem/SaveIntermediateNodeData=true` 以便可逆/调试，稳定后关闭省内存。
+- 若同时用 `Rtabmap/CreateIntermediateNodes`，注意 `Mem/RehearsalIdUpdatedToNewOne` 应保持 false。
 
 ---
 
-## 8. 已知限制
+## 8. 已知限制与兼容性
 
-- 共视用 **BoW 词 ID 交集**（量化级），廉价但粒度受词典影响；可后续升级为 **TF-IDF 加权的稀有词覆盖率**（更强调独特性）。
+- **与 `Mem/ReduceGraph` 互斥**：图缩减不支持中间节点（源码 `Memory::moveSignatureToWMFromSTM` 明确 "Graph reduction with intermediate nodes is not supported"）。本功能会降级出中间节点，故二者不能同时开；若检测到同时开启，会打印告警并**自动禁用本功能**。
+- **可逆性 / 调试**：`Memory::convertToIntermediate()` 是破坏性的（清特征、从倒排索引移除、默认删词）。若需先验证再省内存，可设 `Mem/SaveIntermediateNodeData=true`：降级节点仍被排除出回环检测，但其词被保留（可恢复/可调试），稳定后再关掉以释放内存。
+- 共视用 `compareTo()`（BoW 词匹配，量化级），廉价但粒度受词典影响；阈值的绝对值会随特征数/词典轻微漂移，跨数据集建议据实标定（可参考 `Mem/RehearsalSimilarity` 的取值，本阈值应取得比它更严格）。后续可升级为相对/分位数自适应阈值，或 TF-IDF 加权的稀有词覆盖率。
 - 仅在**建图（incremental）模式**生效；定位模式不降级。
-- 锚点为"最后保留的关键帧"，是单锚点近似；多锚点（图邻域并集覆盖）会更严格，但更复杂，本版未实现。
+- **单锚点**（最后保留关键帧）是保守近似：只消减相对紧邻关键帧冗余的帧，不会因感知混叠误删远处真地点；代价是漏掉"对更早关键帧冗余"的帧（这些被安全保留）。多锚点（空间近邻并集 + 里程计空间闸门）可更激进，属后续工作。
+- **决策时机**为节点 admission（建帧时），此时当前帧尚无回环边，因此本逻辑**只降级当前新帧、从不回溯删除过去节点** → 已携带回环/路标边的历史关键帧绝不会被误降。若想消减"事后才发现冗余"的历史节点，可在节点离开 STM（`moveSignatureToWMFromSTM`）时做回溯式剔除并加回环边保护，属后续工作。
 - 默认关闭（`ratio=0`），需显式开启。
 
 ---
