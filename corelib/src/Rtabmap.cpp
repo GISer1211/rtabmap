@@ -173,6 +173,10 @@ Rtabmap::Rtabmap() :
 	_wDir(""),
 	_mapCorrection(Transform::getIdentity()),
 	_lastLocalizationNodeId(0),
+	_covisRedundancyRatio(Parameters::defaultMemCovisibilityRedundancyRatio()),
+	_covisMaxIntermediateNodes(Parameters::defaultMemCovisibilityMaxIntermediateNodes()),
+	_lastKeyframeId(0),
+	_consecutiveIntermediateNodes(0),
 	_currentSessionHasGPS(false),
 	_lastRejectedLoopClosureIds(0,0),
 	_pathStatus(0),
@@ -478,6 +482,8 @@ void Rtabmap::close(bool databaseSaved, const std::string & ouputDatabasePath)
 	_lastLocalizationNodeId = 0;
 	_odomCachePoses.clear();
 	_odomCacheConstraints.clear();
+	_lastKeyframeId = 0;
+	_consecutiveIntermediateNodes = 0;
 	_distanceTravelled = 0.0f;
 	_distanceTravelledSinceLastLocalization = 0.0f;
 	_optimizeFromGraphEndChanged = false;
@@ -592,6 +598,8 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 	Parameters::parse(parameters, Parameters::kMemImageKept(), _rawDataKept);
 	Parameters::parse(parameters, Parameters::kRGBDEnabled(), _rgbdSlamMode);
 	Parameters::parse(parameters, Parameters::kRGBDLinearUpdate(), _rgbdLinearUpdate);
+	Parameters::parse(parameters, Parameters::kMemCovisibilityRedundancyRatio(), _covisRedundancyRatio);
+	Parameters::parse(parameters, Parameters::kMemCovisibilityMaxIntermediateNodes(), _covisMaxIntermediateNodes);
 	Parameters::parse(parameters, Parameters::kRGBDAngularUpdate(), _rgbdAngularUpdate);
 	Parameters::parse(parameters, Parameters::kRGBDLinearSpeedUpdate(), _rgbdLinearSpeedUpdate);
 	Parameters::parse(parameters, Parameters::kRGBDAngularSpeedUpdate(), _rgbdAngularSpeedUpdate);
@@ -922,6 +930,8 @@ int Rtabmap::triggerNewMap()
 		_lastLocalizationNodeId = 0;
 		_odomCachePoses.clear();
 		_odomCacheConstraints.clear();
+		_lastKeyframeId = 0;
+		_consecutiveIntermediateNodes = 0;
 		_distanceTravelled = 0.0f;
 		_distanceTravelledSinceLastLocalization = 0.0f;
 
@@ -1106,6 +1116,8 @@ void Rtabmap::resetMemory()
 	_lastLocalizationNodeId = 0;
 	_odomCachePoses.clear();
 	_odomCacheConstraints.clear();
+	_lastKeyframeId = 0;
+	_consecutiveIntermediateNodes = 0;
 	_distanceTravelled = 0.0f;
 	_distanceTravelledSinceLastLocalization = 0.0f;
 	_optimizeFromGraphEndChanged = false;
@@ -1592,6 +1604,67 @@ bool Rtabmap::process(
 			if(linkedToIntermediateNode && (smallDisplacement || tooFastMovement))
 			{
 				_memory->convertToIntermediate(signature->id());
+			}
+
+			//============================================================
+			// Covisibility-based keyframe redundancy reduction (A+B)
+			// Demote a new keyframe to an intermediate node (keeping its
+			// odometry/neighbor links for graph optimization, but excluding
+			// it from loop closure detection) when its visual content is
+			// already well covered by the last kept keyframe. Using the
+			// "coverage ratio" (shared words / current words) naturally keeps
+			// distinctive frames (those bringing substantial new content have
+			// a low coverage ratio). The last kept keyframe is used as anchor
+			// so the criterion is self-bounding w.r.t. scene change.
+			//============================================================
+			bool redundantKeyframe = false;
+			if(_covisRedundancyRatio > 0.0f &&
+			   _memory->isIncremental() &&
+			   signature->getWeight() >= 0 &&         // not an intermediate node already
+			   !smallDisplacement && !tooFastMovement && // already handled above
+			   !(_covisMaxIntermediateNodes > 0 && _consecutiveIntermediateNodes >= _covisMaxIntermediateNodes))
+			{
+				const Signature * anchor = _lastKeyframeId>0 ? _memory->getSignature(_lastKeyframeId) : 0;
+				if(anchor && anchor->getWeight() >= 0 &&
+				   !anchor->getWords().empty() && !signature->getWords().empty())
+				{
+					std::set<int> anchorWords;
+					for(std::multimap<int, int>::const_iterator iter=anchor->getWords().begin(); iter!=anchor->getWords().end(); ++iter)
+					{
+						anchorWords.insert(iter->first);
+					}
+					std::set<int> currentWords;
+					int shared = 0;
+					for(std::multimap<int, int>::const_iterator iter=signature->getWords().begin(); iter!=signature->getWords().end(); ++iter)
+					{
+						if(currentWords.insert(iter->first).second && anchorWords.find(iter->first) != anchorWords.end())
+						{
+							++shared;
+						}
+					}
+					float coverageRatio = currentWords.empty()?0.0f:float(shared)/float(currentWords.size());
+					if(coverageRatio > _covisRedundancyRatio)
+					{
+						redundantKeyframe = true;
+						_memory->convertToIntermediate(signature->id());
+						UDEBUG("Covisibility redundancy: node %d demoted to intermediate (coverage=%.2f > %.2f with keyframe %d)",
+								signature->id(), coverageRatio, _covisRedundancyRatio, _lastKeyframeId);
+					}
+				}
+			}
+			// Anchor bookkeeping (mapping mode only)
+			if(_memory->isIncremental())
+			{
+				if(redundantKeyframe)
+				{
+					++_consecutiveIntermediateNodes;
+				}
+				else if(signature->getWeight() >= 0 && !smallDisplacement && !tooFastMovement)
+				{
+					// kept as a real keyframe -> becomes the new covisibility anchor
+					_lastKeyframeId = signature->id();
+					_consecutiveIntermediateNodes = 0;
+				}
 			}
 		}
 

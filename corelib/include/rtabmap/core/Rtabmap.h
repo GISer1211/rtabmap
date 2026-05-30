@@ -380,6 +380,10 @@ private:
 	Transform _mapCorrectionBackup; // used in localization mode when odom is lost
 	Transform _lastLocalizationPose; // Corrected odometry pose. In mapping mode, this corresponds to last pose return by getLocalOptimizedPoses().
 	int _lastLocalizationNodeId; // for localization mode
+	float _covisRedundancyRatio; // covisibility-based keyframe redundancy reduction (0=disabled)
+	int _covisMaxIntermediateNodes; // max consecutive covisibility-demoted nodes (0=no limit)
+	int _lastKeyframeId; // last kept (non-intermediate) keyframe used as covisibility anchor
+	int _consecutiveIntermediateNodes; // consecutive nodes demoted by covisibility redundancy
 	cv::Mat _localizationCovariance;
 	std::map<int, std::pair<cv::Point3d, Transform> > _gpsGeocentricCache;
 	bool _currentSessionHasGPS;
