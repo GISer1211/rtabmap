@@ -469,6 +469,13 @@ Transform RegistrationDense::computeTransformationImpl(
 	const double geoW = _geometricWeight;
 
 	int totalUsedFinest = 0;
+	// Divergence guard (C3): track the normalized robust residual at the finest
+	// level, comparing the first iteration (initial estimate, e.g. a raw odometry
+	// guess when the upstream Vis registration failed) to the last one. If the
+	// residual did not decrease, the refinement diverged and we keep the guess.
+	double finestRefPhoto = 1.0, finestRefGeo = 1.0;
+	double finestInitCost = 0.0, finestFinalCost = 0.0;
+	bool finestCostTracked = false;
 
 	// Coarse-to-fine optimization.
 	for(int l=_pyramidLevels-1; l>=0; --l)
@@ -623,6 +630,23 @@ Transform RegistrationDense::computeTransformationImpl(
 			double invVarPhoto = 1.0/(sigmaPhoto*sigmaPhoto);
 			double invVarGeo = 1.0/(sigmaGeo*sigmaGeo);
 
+			// Divergence guard (C3): record normalized cost at the finest level.
+			// Each term is normalized by its own first-iteration scale so the
+			// photometric (intensity) and geometric (meters) parts are comparable.
+			if(l == 0)
+			{
+				double cPhoto = (photoW > 0.0 && !absPhoto.empty()) ? sigmaPhoto : 0.0;
+				double cGeo   = (geoW   > 0.0 && !absGeo.empty())   ? sigmaGeo   : 0.0;
+				if(!finestCostTracked)
+				{
+					finestRefPhoto = cPhoto > 0.0 ? cPhoto : 1.0;
+					finestRefGeo   = cGeo   > 0.0 ? cGeo   : 1.0;
+					finestInitCost = (cPhoto>0.0?1.0:0.0) + (cGeo>0.0?1.0:0.0);
+					finestCostTracked = true;
+				}
+				finestFinalCost = (cPhoto>0.0?cPhoto/finestRefPhoto:0.0) + (cGeo>0.0?cGeo/finestRefGeo:0.0);
+			}
+
 			Eigen::Matrix<double,6,6> Hm = Eigen::Matrix<double,6,6>::Zero();
 			Eigen::Matrix<double,6,1> bm = Eigen::Matrix<double,6,1>::Zero();
 
@@ -730,6 +754,17 @@ Transform RegistrationDense::computeTransformationImpl(
 	if(totalUsedFinest < 6)
 	{
 		UDEBUG("Dense refinement under-constrained at finest level (%d points), keeping guess.", totalUsedFinest);
+		return guess;
+	}
+
+	// Divergence guard (C3): reject if the residual did not decrease at the finest
+	// level (protects against converging to a confident-but-wrong estimate when the
+	// upstream registration failed and only a raw odometry guess was available).
+	if(finestCostTracked && finestInitCost > 0.0 && finestFinalCost > finestInitCost * 1.05)
+	{
+		UWARN("Dense refinement rejected: residual did not decrease at the finest level "
+			  "(normalized cost %.3f -> %.3f). Keeping the input guess.",
+			  finestInitCost, finestFinalCost);
 		return guess;
 	}
 

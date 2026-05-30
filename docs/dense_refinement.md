@@ -125,6 +125,10 @@ Reg/Strategy = 2 (VisIcp)  +DenseRefining →  Vis → Icp → Dense
 
 由 `Registration::create()` 工厂根据 `Reg/DenseRefining` 决定是否追加，**不改动 `Reg/Strategy` 枚举语义**，默认关闭，对现有行为零影响。
 
+> **行为变化（C2，消融时需注明）**：给基础配准（如 Vis）挂上 dense child 后，会**关闭该基础配准的 `Reg/RepeatOnce` 自精化**——因为 `Registration::computeTransformationMod` 里 `repeatOnce` 只在"无 child"时执行（走 `else if`）。即 dense **取代**了 Vis 的二次自精化。通常更好（dense 是更强的精化），但属行为变化。注意 dense 不更新 `info` 的 inliers/协方差，故仍沿用 Vis 首次估计的 inliers/cov（见 §4、§7.3）。
+>
+> **上游失败但有里程计初值时（C3）**：若 Vis 返回 null 但有 odom 初值（相邻边/空间邻近场景），链式逻辑会让 dense **直接拿原始 odom 初值**去精化（`else if(!guess.isNull())`）。此时由 §4 的修正量护栏 + Hessian 有效性 + **残差未下降则回退**护栏共同兜底。全局回环通常 guess 为 null，dense 不会在"失败的回环"上乱跑。
+
 数据通路：`Memory::computeTransform` 在 `Reg/DenseRefining=true` 时会确保两帧的**原始左目图像 + 深度**被解压（与回环特征重提取的逻辑一致）。
 
 ---
@@ -137,9 +141,12 @@ dense 精化只在以下条件全满足时才"采纳"结果，否则**回退返�
 - 两帧都有可用的**单相机模型**（mono RGB-D 或双目左目）+ **原始图像 + 深度**；
 - 相对初值的修正量不超过 `Dense/MaxTranslation` / `Dense/MaxRotation`（防发散）；
 - 最细层参与的有效像素 ≥ 6（防欠约束）；
+- **最细层鲁棒残差迭代后必须下降**（归一化代价 final ≤ init×1.05），否则判定发散 → 回退（C3，保护"上游失败、只有 odom 初值"时不产出自信而错误的边）；
 - Hessian 数值有效（非病态）。
 
-此外，dense **默认保留上游（Vis/ICP）估计的协方差**——它只精化变换的"均值"，不改变该回环边在图优化中的权重。
+**`info` 透传（C1）**：dense 的返回值就是整条管线的最终回环变换——若它返回 null，整个回环会被判失败拒绝；因此回退时**必须**返回非空初值（恒成立）。同时 dense **完全不读写 `info`**（协方差/inliers/matches 在所有路径上原样透传），保证回退时不会污染上游估计。
+
+此外，dense **默认保留上游（Vis/ICP）估计的协方差**——它只精化变换的"均值"，不改变该回环边在图优化中的权重（提升空间见 §7.3 的 C4）。
 
 ---
 
@@ -235,18 +242,27 @@ dense 精化**仅在配准发生时触发**，配准只发生在：
 - `Dense/PyramidLevels` 3→2、`Dense/Iterations` 10→5：再省约 2~3 倍；
 - 调到 6.2 节配置：约 **30–80 ms / 次**。
 
-### 7.3 进一步加速（可选改进，尚未实现）
+### 7.3 进一步改进（尚未实现）
 
 - **OpenMP 并行**：像素级 H/b 累加是天然可并行的；多核（如 X5 八核）可再获 3~4 倍加速。
 - 随机/网格采样上限、GPU 化等。
+- **用 GN Hessian 输出协方差（C4，真正再降 ATE 的杠杆）**：当前默认沿用上游 Vis/ICP 的（偏松）协方差，dense 把变换修准了、后端却仍用松权重加权这条边 → ATE 收益打折。更科学的做法是用 dense 收敛时的 Hessian 取 `Σ = s²·H⁻¹`（按鲁棒残差方差标定），再经 `localTransform` 的伴随（adjoint）变换到基座系、对齐 RTABMap 的 6×6 协方差约定。
+  > **为何暂未默认开启**：该协方差必须与 RTABMap 对 link 协方差的内部约定**严格一致**，否则给出过自信/错帧的权重反而**伤 ATE**（比保留上游协方差更糟）。在无法对 RTABMap 实编译验证约定一致性之前，保留上游协方差是更安全的默认；这条作为下一步、并需在真实环境标定验证（也正好接上"深度不确定性信息矩阵"那条线）。
 
 ---
 
-## 8. 已知限制
+## 8. 已知限制与数据要求
 
 - 仅支持**单相机模型**（mono RGB-D 或双目左目）；多相机数据会**安全跳过**（返回初值）。
 - 要求两帧**图像分辨率一致**，且深度图能与左目对齐（不一致时会自动按最近邻缩放深度到图像尺寸）。
 - 精度依赖深度质量；学习/双目深度的远处误差会拉低收益，应配 `Dense/MaxDepth` 限制可信范围。
+- **数据可用性（C5）**：dense 需要 from 和 to 两节点都能解压出 **image + depth**。
+  - 全局回环的 to 节点常来自 LTM，需 `Mem/BinDataKept=true` 且**深度有存库**，否则 dense 优雅跳过（返回初值）。
+  - 数据必须按 **RGB-D（左目 + 深度）** 注册，使 `SensorData::depthRaw()` 非空；若按**原始双目对**注册，`_depthOrRightRaw` 存的是右目，`depthRaw()` 返回空 → dense 拿不到深度会跳过。请确认是用 StereoNet 深度按 RGB-D 注入的。
+- **直接法假设与 StereoNet 特性（C6）**：
+  - 光度残差依赖亮度/曝光稳定——已由 §2.5 的 **ZNCC 全局仿射光照不变**缓解；
+  - StereoNet 在深度不连续处法向不可靠——由 `Dense/MaxCorrespondenceDepthDiff`（拒绝对应深度差过大）+ `Dense/MinGradient` 兜住；
+  - **利好**：from/to 用**同一个 StereoNet**，其系统性深度偏差在"相对点到面"残差里大幅抵消，故几何项比想象中更稳。
 - 它精化**变换均值**，不改变回环边协方差（权重仍来自上游 Vis/ICP）。
 - 单一平面等几何退化场景，点到面项欠约束，此时主要靠光度项（有纹理即可良好收敛）。
 
