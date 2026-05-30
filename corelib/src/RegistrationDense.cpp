@@ -47,6 +47,7 @@ RegistrationDense::RegistrationDense(const ParametersMap & parameters, Registrat
 	_minGradient(Parameters::defaultDenseMinGradient()),
 	_geometricWeight(Parameters::defaultDenseGeometricWeight()),
 	_photometricWeight(Parameters::defaultDensePhotometricWeight()),
+	_photoIlluminationInvariant(Parameters::defaultDenseIlluminationInvariant()),
 	_huberThreshold(Parameters::defaultDenseHuberThreshold()),
 	_convergenceEps(Parameters::defaultDenseConvergenceEps()),
 	_maxCorrespondenceDepthDiff(Parameters::defaultDenseMaxCorrespondenceDepthDiff()),
@@ -72,6 +73,7 @@ void RegistrationDense::parseParameters(const ParametersMap & parameters)
 	Parameters::parse(parameters, Parameters::kDenseMinGradient(), _minGradient);
 	Parameters::parse(parameters, Parameters::kDenseGeometricWeight(), _geometricWeight);
 	Parameters::parse(parameters, Parameters::kDensePhotometricWeight(), _photometricWeight);
+	Parameters::parse(parameters, Parameters::kDenseIlluminationInvariant(), _photoIlluminationInvariant);
 	Parameters::parse(parameters, Parameters::kDenseHuberThreshold(), _huberThreshold);
 	Parameters::parse(parameters, Parameters::kDenseConvergenceEps(), _convergenceEps);
 	Parameters::parse(parameters, Parameters::kDenseMaxCorrespondenceDepthDiff(), _maxCorrespondenceDepthDiff);
@@ -283,7 +285,8 @@ inline float depthAt(const cv::Mat & depth, int u, int v)
 struct Corr
 {
 	Eigen::Vector3d Y;   // warped point in target optical frame
-	double rp;           // photometric residual
+	double rp;           // photometric residual (filled after optional normalization)
+	double iFrom, iTo;   // raw reference / warped-target intensities
 	double gx, gy;       // target image gradient at warped pixel
 	bool hasPhoto;
 	Eigen::Vector3d n;   // target normal
@@ -482,6 +485,9 @@ Transform RegistrationDense::computeTransformationImpl(
 			corrs.reserve((size_t)(lvl.width/lvl.step)*(lvl.height/lvl.step));
 			std::vector<double> absPhoto;
 			std::vector<double> absGeo;
+			// Accumulators for optional global affine illumination normalization (ZNCC-style).
+			double sumFrom=0.0, sumFrom2=0.0, sumTo=0.0, sumTo2=0.0;
+			int photoCount=0;
 
 			for(int v=0; v<lvl.height; v+=lvl.step)
 			{
@@ -525,11 +531,17 @@ Transform RegistrationDense::computeTransformationImpl(
 							double gMag = std::sqrt(gx*gx + gy*gy);
 							if(gMag >= _minGradient || _minGradient <= 0.0f)
 							{
-								c.rp = iTo - intenRow[u];
+								double iFrom = intenRow[u];
+								c.iFrom = iFrom;
+								c.iTo = iTo;
+								c.rp = iTo - iFrom; // raw (may be replaced by normalized below)
 								c.gx = gx;
 								c.gy = gy;
 								c.hasPhoto = true;
-								absPhoto.push_back(std::fabs(c.rp));
+								// stats for illumination normalization
+								sumFrom += iFrom;  sumFrom2 += iFrom*iFrom;
+								sumTo   += iTo;    sumTo2   += iTo*iTo;
+								++photoCount;
 							}
 						}
 					}
@@ -571,6 +583,36 @@ Transform RegistrationDense::computeTransformationImpl(
 				UDEBUG("Dense refinement level %d iter %d: too few correspondences (%d), stopping level.",
 						l, iter, (int)corrs.size());
 				break;
+			}
+
+			// Photometric residuals with optional global affine illumination invariance
+			// (ZNCC-style: zero-mean + unit-std normalization of the sampled intensities).
+			// This makes the photometric term invariant to a global gain/bias change
+			// (e.g. different exposure/lighting between two revisits) at near-zero cost.
+			// When disabled (or too few points), it reduces exactly to the raw residual.
+			double muFrom=0.0, muTo=0.0, sFrom=1.0, sTo=1.0;
+			if(_photoIlluminationInvariant && photoCount >= 20)
+			{
+				muFrom = sumFrom/photoCount;
+				muTo   = sumTo/photoCount;
+				double varFrom = sumFrom2/photoCount - muFrom*muFrom;
+				double varTo   = sumTo2/photoCount - muTo*muTo;
+				// floor std at 1 intensity level (low-texture -> graceful fallback to bias-only)
+				sFrom = varFrom > 1.0 ? std::sqrt(varFrom) : 1.0;
+				sTo   = varTo   > 1.0 ? std::sqrt(varTo)   : 1.0;
+			}
+			const double invSTo = 1.0/sTo;
+			const double invSFrom = 1.0/sFrom;
+			for(size_t i=0; i<corrs.size(); ++i)
+			{
+				Corr & c = corrs[i];
+				if(c.hasPhoto)
+				{
+					c.rp = (c.iTo - muTo)*invSTo - (c.iFrom - muFrom)*invSFrom;
+					c.gx *= invSTo;
+					c.gy *= invSTo;
+					absPhoto.push_back(std::fabs(c.rp));
+				}
 			}
 
 			// Robust per-term scales (auto-balances photometric vs geometric units).

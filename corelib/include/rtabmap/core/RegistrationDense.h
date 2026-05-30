@@ -82,6 +82,7 @@ private:
 	float _minGradient;
 	float _geometricWeight;
 	float _photometricWeight;
+	bool _photoIlluminationInvariant;
 	float _huberThreshold;
 	float _convergenceEps;
 	float _maxCorrespondenceDepthDiff;
