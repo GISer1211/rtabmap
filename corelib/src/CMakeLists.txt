@@ -83,6 +83,7 @@ SET(SRC_FILES
     Registration.cpp
     RegistrationIcp.cpp
     RegistrationVis.cpp
+    RegistrationDense.cpp
     
     Odometry.cpp
     OdometryThread.cpp

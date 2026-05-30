@@ -28,6 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <rtabmap/core/RegistrationVis.h>
 #include <rtabmap/core/RegistrationIcp.h>
+#include <rtabmap/core/RegistrationDense.h>
 #include <rtabmap/utilite/ULogger.h>
 #include <rtabmap/utilite/UTimer.h>
 
@@ -47,17 +48,25 @@ Registration * Registration::create(const ParametersMap & parameters)
 Registration * Registration::create(Registration::Type & type, const ParametersMap & parameters)
 {
 	UDEBUG("type=%d", (int)type);
+
+	// Optional dense RGB-D refinement appended as the deepest child of the pipeline.
+	// It runs after the selected strategy and refines the estimated transform using
+	// the depth images (photometric direct + point-to-plane geometric alignment).
+	bool denseRefining = Parameters::defaultRegDenseRefining();
+	Parameters::parse(parameters, Parameters::kRegDenseRefining(), denseRefining);
+	Registration * denseChild = denseRefining ? new RegistrationDense(parameters) : 0;
+
 	Registration * reg = 0;
 	switch(type)
 	{
 	case Registration::kTypeIcp:
-		reg = new RegistrationIcp(parameters);
+		reg = new RegistrationIcp(parameters, denseChild);
 		break;
 	case Registration::kTypeVisIcp:
-		reg = new RegistrationVis(parameters, new RegistrationIcp(parameters));
+		reg = new RegistrationVis(parameters, new RegistrationIcp(parameters, denseChild));
 		break;
 	default: // kTypeVis
-		reg = new RegistrationVis(parameters);
+		reg = new RegistrationVis(parameters, denseChild);
 		type = Registration::kTypeVis;
 		break;
 	}
