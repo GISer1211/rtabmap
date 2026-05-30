@@ -336,6 +336,7 @@ private:
 	bool _reextractLoopClosureFeatures;
 	bool _localBundleOnLoopClosure;
 	bool _invertedReg;
+	bool _denseRefining;
 	float _rehearsalMaxDistance;
 	float _rehearsalMaxAngle;
 	bool _rehearsalWeightIgnoredWhileMoving;

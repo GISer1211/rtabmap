@@ -707,6 +707,22 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(Reg, RepeatOnce,               bool, true,    "Do a second registration with the output of the first registration as guess. Only done if no guess was provided for the first registration (like on loop closure). It can be useful if the registration approach used can use a guess to get better matches.");
     RTABMAP_PARAM(Reg, Strategy,                 int, 0,        "0=Vis, 1=Icp, 2=VisIcp");
     RTABMAP_PARAM(Reg, Force3DoF,                bool, false,   "Force 3 degrees-of-freedom transform (3Dof: x,y and yaw). Parameters z, roll and pitch will be set to 0.");
+    RTABMAP_PARAM(Reg, DenseRefining,            bool, false,   uFormat("Refine the transform estimated by the selected registration strategy (%s) with a dense RGB-D alignment (joint photometric direct + point-to-plane geometric error) using the depth images. This runs as a final refinement step appended after the registration pipeline and needs an initial guess (so it is applied on loop closures, proximity detections and neighbor link refining where a transform is already estimated). It is meant for RGB-D data with dense depth maps (e.g., stereo network depth). See \"Dense\" group for parameters.", kRegStrategy().c_str()));
+
+    // Dense RGB-D refinement parameters (used when Reg/DenseRefining=true)
+    RTABMAP_PARAM(Dense, Iterations,             int,   10,     "Maximum number of Gauss-Newton iterations per pyramid level.");
+    RTABMAP_PARAM(Dense, PyramidLevels,          int,   3,      "Number of coarse-to-fine image pyramid levels (>=1). The optimization starts at the coarsest level and refines down to the finest.");
+    RTABMAP_PARAM(Dense, Decimation,             int,   2,      "Pixel sub-sampling step at the finest level (use every Nth pixel along each axis). Higher values are faster but use fewer constraints.");
+    RTABMAP_PARAM(Dense, MinDepth,               float, 0.3,    "Minimum reliable depth (m). Pixels with depth below this are ignored.");
+    RTABMAP_PARAM(Dense, MaxDepth,               float, 8.0,    "Maximum reliable depth (m, 0=disabled). Pixels with depth over this are ignored. Useful with learned/stereo depth whose far values are unreliable.");
+    RTABMAP_PARAM(Dense, MinGradient,            float, 12.0,   "Minimum image intensity gradient magnitude (0-255 scale) for a pixel to contribute to the photometric term. Low-texture pixels are ignored to keep the photometric term well-conditioned.");
+    RTABMAP_PARAM(Dense, GeometricWeight,        float, 1.0,    "Relative weight (lambda) of the point-to-plane geometric error with respect to the photometric error in the combined cost. 0 disables the geometric term (pure photometric), a large value emphasizes geometry.");
+    RTABMAP_PARAM(Dense, PhotometricWeight,      float, 1.0,    "Relative weight of the photometric error in the combined cost. 0 disables the photometric term (pure geometric/point-to-plane ICP).");
+    RTABMAP_PARAM(Dense, HuberThreshold,         float, 1.345,  "Huber robust kernel threshold (in units of the robustly-estimated residual standard deviation). Residuals are normalized by a per-iteration MAD-based scale so photometric and geometric terms are balanced automatically.");
+    RTABMAP_PARAM(Dense, ConvergenceEps,         float, 0.0001, "Convergence threshold: iterations stop when the norm of the incremental update (rad+m) is below this value.");
+    RTABMAP_PARAM(Dense, MaxCorrespondenceDepthDiff, float, 0.2, "Maximum depth difference (m) between a warped point and the measured target depth for a valid correspondence. Rejects occlusions/depth discontinuities.");
+    RTABMAP_PARAM(Dense, MaxTranslation,         float, 0.2,    "Safety guard: if the refinement moves the translation more than this (m) away from the input guess, the refinement is rejected and the input guess is kept. 0=disabled.");
+    RTABMAP_PARAM(Dense, MaxRotation,            float, 0.2,    "Safety guard: if the refinement rotates more than this (rad) away from the input guess, the refinement is rejected and the input guess is kept. 0=disabled.");
 
     // Visual registration parameters
     RTABMAP_PARAM(Vis, EstimationType,           int,    1,     "Motion estimation approach: 0:3D->3D, 1:3D->2D (PnP), 2:2D->2D (Epipolar Geometry)");
