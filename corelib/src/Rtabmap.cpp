@@ -1664,16 +1664,23 @@ bool Rtabmap::process(
 					}
 				}
 			}
-			// Anchor bookkeeping (mapping mode only)
+			// Anchor bookkeeping (mapping mode only).
+			// IMPORTANT: _lastKeyframeId is updated ONLY when the node is kept as a full
+			// keyframe; it is never moved onto a demoted (intermediate) node. Hence the
+			// covisibility anchor always points to the last KEPT full keyframe, whose
+			// words stay intact (convertToIntermediate clears words when
+			// Mem/SaveIntermediateNodeData=false). This is what keeps compression high in
+			// long corridors: we compare against the last kept keyframe, not the previous
+			// (possibly just-demoted, empty-words) node.
 			if(_memory->isIncremental())
 			{
 				if(redundantKeyframe)
 				{
-					++_consecutiveIntermediateNodes;
+					++_consecutiveIntermediateNodes; // anchor unchanged
 				}
 				else if(signature->getWeight() >= 0 && !smallDisplacement && !tooFastMovement)
 				{
-					// kept as a real keyframe -> becomes the new covisibility anchor
+					// kept as a full keyframe -> becomes the new covisibility anchor
 					_lastKeyframeId = signature->id();
 					_consecutiveIntermediateNodes = 0;
 				}
